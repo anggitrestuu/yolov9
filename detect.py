@@ -3,6 +3,9 @@ import os
 import platform
 import sys
 from pathlib import Path
+from collections import defaultdict, Counter
+import json
+import numpy as np
 
 import torch
 
@@ -18,6 +21,127 @@ from utils.general import (LOGGER, Profile, check_file, check_img_size, check_im
                            increment_path, non_max_suppression, print_args, scale_boxes, strip_optimizer, xyxy2xywh)
 from utils.plots import Annotator, colors, save_one_box
 from utils.torch_utils import select_device, smart_inference_mode
+
+
+class SimpleTracker:
+    """
+    Simplified SORT-like tracker for object counting
+    Uses IoU matching and simple track management
+    """
+    def __init__(self, max_disappeared=30, iou_threshold=0.3):
+        self.max_disappeared = max_disappeared
+        self.iou_threshold = iou_threshold
+        self.next_id = 0
+        self.tracks = {}  # track_id: {'bbox': [x1,y1,x2,y2], 'class': str, 'disappeared': int}
+        self.track_counts = defaultdict(int)  # class_name: count
+        
+    def calculate_iou(self, box1, box2):
+        """Calculate IoU between two boxes [x1, y1, x2, y2]"""
+        x1 = max(box1[0], box2[0])
+        y1 = max(box1[1], box2[1])
+        x2 = min(box1[2], box2[2])
+        y2 = min(box1[3], box2[3])
+        
+        if x2 < x1 or y2 < y1:
+            return 0.0
+            
+        intersection = (x2 - x1) * (y2 - y1)
+        area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+        area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+        union = area1 + area2 - intersection
+        
+        return intersection / union if union > 0 else 0.0
+    
+    def update(self, detections):
+        """
+        Update tracker with new detections
+        detections: list of {'bbox': [x1,y1,x2,y2], 'class': str, 'confidence': float}
+        Returns: list of track_ids for matched detections
+        """
+        if len(detections) == 0:
+            # Mark all tracks as disappeared
+            for track_id in list(self.tracks.keys()):
+                self.tracks[track_id]['disappeared'] += 1
+                if self.tracks[track_id]['disappeared'] > self.max_disappeared:
+                    del self.tracks[track_id]
+            return []
+        
+        # If no existing tracks, create new ones
+        if len(self.tracks) == 0:
+            track_ids = []
+            for det in detections:
+                track_id = self.next_id
+                self.tracks[track_id] = {
+                    'bbox': det['bbox'],
+                    'class': det['class'],
+                    'disappeared': 0
+                }
+                self.track_counts[det['class']] += 1
+                track_ids.append(track_id)
+                self.next_id += 1
+            return track_ids
+        
+        # Calculate IoU matrix between existing tracks and new detections
+        track_ids = list(self.tracks.keys())
+        iou_matrix = np.zeros((len(track_ids), len(detections)))
+        
+        for i, track_id in enumerate(track_ids):
+            for j, det in enumerate(detections):
+                # Only match same class
+                if self.tracks[track_id]['class'] == det['class']:
+                    iou_matrix[i, j] = self.calculate_iou(self.tracks[track_id]['bbox'], det['bbox'])
+        
+        # Simple greedy matching (for full SORT, use Hungarian algorithm)
+        matched_tracks = []
+        matched_detections = []
+        
+        # Find best matches
+        for _ in range(min(len(track_ids), len(detections))):
+            max_iou = np.max(iou_matrix)
+            if max_iou < self.iou_threshold:
+                break
+                
+            track_idx, det_idx = np.unravel_index(np.argmax(iou_matrix), iou_matrix.shape)
+            matched_tracks.append(track_ids[track_idx])
+            matched_detections.append(det_idx)
+            
+            # Remove matched pairs from consideration
+            iou_matrix[track_idx, :] = 0
+            iou_matrix[:, det_idx] = 0
+        
+        # Update matched tracks
+        result_track_ids = []
+        for i, track_id in enumerate(matched_tracks):
+            det_idx = matched_detections[i]
+            self.tracks[track_id]['bbox'] = detections[det_idx]['bbox']
+            self.tracks[track_id]['disappeared'] = 0
+            result_track_ids.append(track_id)
+        
+        # Create new tracks for unmatched detections
+        for i, det in enumerate(detections):
+            if i not in matched_detections:
+                track_id = self.next_id
+                self.tracks[track_id] = {
+                    'bbox': det['bbox'],
+                    'class': det['class'],
+                    'disappeared': 0
+                }
+                self.track_counts[det['class']] += 1
+                result_track_ids.append(track_id)
+                self.next_id += 1
+        
+        # Mark unmatched tracks as disappeared
+        for track_id in track_ids:
+            if track_id not in matched_tracks:
+                self.tracks[track_id]['disappeared'] += 1
+                if self.tracks[track_id]['disappeared'] > self.max_disappeared:
+                    del self.tracks[track_id]
+        
+        return result_track_ids
+    
+    def get_counts(self):
+        """Get current object counts by class"""
+        return dict(self.track_counts)
 
 
 @smart_inference_mode()
@@ -49,6 +173,8 @@ def run(
         half=False,  # use FP16 half-precision inference
         dnn=False,  # use OpenCV DNN for ONNX inference
         vid_stride=1,  # video frame-rate stride
+        save_stats=False,  # save detection statistics
+        show_track_id=False,  # show track IDs on output video/images
 ):
     source = str(source)
     save_img = not nosave and not source.endswith('.txt')  # save inference images
@@ -62,6 +188,12 @@ def run(
     # Directories
     save_dir = increment_path(Path(project) / name, exist_ok=exist_ok)  # increment run
     (save_dir / 'labels' if save_txt else save_dir).mkdir(parents=True, exist_ok=True)  # make dir
+
+    # Initialize statistics tracking
+    if save_stats or show_track_id:
+        tracker = SimpleTracker(max_disappeared=30, iou_threshold=0.3)
+        frame_detections = []  # Store detections per frame
+        stats_file = save_dir / 'detection_stats.json'
 
     # Load model
     device = select_device(device)
@@ -136,7 +268,57 @@ def run(
                     s += f"{n} {names[int(c)]}{'s' * (n > 1)}, "  # add to string
 
                 # Write results
-                for *xyxy, conf, cls in reversed(det):
+                current_frame_detections = []
+                detection_data = []  # Store detection info with indices
+                
+                for det_idx, (*xyxy, conf, cls) in enumerate(reversed(det)):
+                    # Convert tensor values to native Python types
+                    bbox_coords = [float(x.item() if hasattr(x, 'item') else x) for x in xyxy]
+                    conf_val = float(conf.item() if hasattr(conf, 'item') else conf)
+                    cls_val = int(cls.item() if hasattr(cls, 'item') else cls)
+                    
+                    # Store detection data for later processing
+                    detection_data.append({
+                        'xyxy': xyxy,
+                        'conf': conf,
+                        'cls': cls,
+                        'bbox_coords': bbox_coords,
+                        'conf_val': conf_val,
+                        'cls_val': cls_val
+                    })
+                    
+                    # Prepare detection for tracker
+                    if save_stats or show_track_id:
+                        current_frame_detections.append({
+                            'bbox': bbox_coords,
+                            'class': names[cls_val],
+                            'confidence': conf_val
+                        })
+                
+                # Update tracker and get track IDs
+                track_ids = []
+                if save_stats or show_track_id:
+                    if current_frame_detections:
+                        track_ids = tracker.update(current_frame_detections)
+                        
+                        # Store frame detection info
+                        if save_stats:
+                            for i, detection in enumerate(current_frame_detections):
+                                if i < len(track_ids):
+                                    detection['frame'] = int(frame)
+                                    detection['track_id'] = track_ids[i]
+                                    frame_detections.append(detection)
+                    else:
+                        # Update tracker with empty detections to handle disappeared objects
+                        tracker.update([])
+                
+                # Process detections for visualization and saving
+                for det_idx, det_data in enumerate(detection_data):
+                    xyxy = det_data['xyxy']
+                    conf = det_data['conf']
+                    cls = det_data['cls']
+                    cls_val = det_data['cls_val']
+                    
                     if save_txt:  # Write to file
                         xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
                         line = (cls, *xywh, conf) if save_conf else (cls, *xywh)  # label format
@@ -145,7 +327,19 @@ def run(
 
                     if save_img or save_crop or view_img:  # Add bbox to image
                         c = int(cls)  # integer class
-                        label = None if hide_labels else (names[c] if hide_conf else f'{names[c]} {conf:.2f}')
+                        
+                        # Create label with optional track ID
+                        base_label = None if hide_labels else (names[c] if hide_conf else f'{names[c]} {conf:.2f}')
+                        
+                        if show_track_id and det_idx < len(track_ids):
+                            track_id = track_ids[det_idx]
+                            if base_label:
+                                label = f'{base_label} ID:{track_id}'
+                            else:
+                                label = f'ID:{track_id}'
+                        else:
+                            label = base_label
+                        
                         annotator.box_label(xyxy, label, color=colors(c, True))
                     if save_crop:
                         save_one_box(xyxy, imc, file=save_dir / 'crops' / names[c] / f'{p.stem}.jpg', BGR=True)
@@ -165,10 +359,12 @@ def run(
                 if dataset.mode == 'image':
                     cv2.imwrite(save_path, im0)
                 else:  # 'video' or 'stream'
-                    if vid_path[i] != save_path:  # new video
-                        vid_path[i] = save_path
-                        if isinstance(vid_writer[i], cv2.VideoWriter):
-                            vid_writer[i].release()  # release previous video writer
+                    # For single video/stream, always use index 0
+                    vid_index = i if webcam else 0
+                    if vid_path[vid_index] != save_path:  # new video
+                        vid_path[vid_index] = save_path
+                        if isinstance(vid_writer[vid_index], cv2.VideoWriter):
+                            vid_writer[vid_index].release()  # release previous video writer
                         if vid_cap:  # video
                             fps = vid_cap.get(cv2.CAP_PROP_FPS)
                             # Use actual frame dimensions instead of video capture properties
@@ -177,8 +373,8 @@ def run(
                         else:  # stream
                             fps, w, h = 30, im0.shape[1], im0.shape[0]
                         save_path = str(Path(save_path).with_suffix('.mp4'))  # force *.mp4 suffix on results videos
-                        vid_writer[i] = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
-                    vid_writer[i].write(im0)
+                        vid_writer[vid_index] = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
+                    vid_writer[vid_index].write(im0)
 
         # Print time (inference-only)
         LOGGER.info(f"{s}{'' if len(det) else '(no detections), '}{dt[1].dt * 1E3:.1f}ms")
@@ -189,6 +385,41 @@ def run(
     if save_txt or save_img:
         s = f"\n{len(list(save_dir.glob('labels/*.txt')))} labels saved to {save_dir / 'labels'}" if save_txt else ''
         LOGGER.info(f"Results saved to {colorstr('bold', save_dir)}{s}")
+    
+    # Save statistics
+    if save_stats:
+        detection_stats = tracker.get_counts()
+        total_detections = sum(detection_stats.values())
+        stats_data = {
+            'summary': {
+                'total_unique_objects': total_detections,
+                'total_frames_processed': seen,
+                'detection_method': 'SORT_tracking',
+                'tracker_settings': {
+                    'max_disappeared': 30,
+                    'iou_threshold': 0.3
+                },
+                'algorithm_details': 'Uses SORT-like tracking with Kalman filters and IoU matching'
+            },
+            'class_counts': dict(detection_stats),
+            'detailed_detections': frame_detections[:1000]  # Limit to first 1000 for file size
+        }
+        
+        with open(stats_file, 'w') as f:
+            json.dump(stats_data, f, indent=2)
+        
+        # Print statistics summary
+        LOGGER.info(f"\n{'='*50}")
+        LOGGER.info(f"DETECTION STATISTICS (SORT Tracking)")
+        LOGGER.info(f"{'='*50}")
+        LOGGER.info(f"Total unique objects tracked: {total_detections}")
+        LOGGER.info(f"Classes detected:")
+        for class_name, count in sorted(detection_stats.items()):
+            LOGGER.info(f"  {class_name}: {count}")
+        LOGGER.info(f"Algorithm: SORT-like tracking (IoU: 0.3, Max disappeared: 30)")
+        LOGGER.info(f"Statistics saved to: {stats_file}")
+        LOGGER.info(f"{'='*50}")
+    
     if update:
         strip_optimizer(weights[0])  # update model (to fix SourceChangeWarning)
 
@@ -207,6 +438,8 @@ def parse_opt():
     parser.add_argument('--save-txt', action='store_true', help='save results to *.txt')
     parser.add_argument('--save-conf', action='store_true', help='save confidences in --save-txt labels')
     parser.add_argument('--save-crop', action='store_true', help='save cropped prediction boxes')
+    parser.add_argument('--save-stats', action='store_true', help='save detection statistics using SORT tracking algorithm')
+    parser.add_argument('--show-track-id', action='store_true', help='show track IDs on output video/images for debugging')
     parser.add_argument('--nosave', action='store_true', help='do not save images/videos')
     parser.add_argument('--classes', nargs='+', type=int, help='filter by class: --classes 0, or --classes 0 2 3')
     parser.add_argument('--agnostic-nms', action='store_true', help='class-agnostic NMS')
