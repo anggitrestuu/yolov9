@@ -294,7 +294,7 @@ class LoadImages:
                 ret_val, im0 = self.cap.read()
 
             self.frame += 1
-            # im0 = self._cv2_rotate(im0)  # for use if cv2 autorotation is False
+            im0 = self._cv2_rotate(im0)  # Apply rotation to maintain orientation
             s = f'video {self.count + 1}/{self.nf} ({self.frame}/{self.frames}) {path}: '
 
         else:
@@ -318,17 +318,36 @@ class LoadImages:
         self.frame = 0
         self.cap = cv2.VideoCapture(path)
         self.frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT) / self.vid_stride)
+        
+        # Get orientation metadata
         self.orientation = int(self.cap.get(cv2.CAP_PROP_ORIENTATION_META))  # rotation degrees
+        
+        # Log video properties for debugging
+        width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        print(f"Video: {path}")
+        print(f"  Original dimensions: {width}x{height}")
+        print(f"  Orientation metadata: {self.orientation}°")
+        print(f"  Portrait mode: {height > width}")
+        
+        # Disable auto-rotation to handle it manually
         # self.cap.set(cv2.CAP_PROP_ORIENTATION_AUTO, 0)  # disable https://github.com/ultralytics/yolov5/issues/8493
 
     def _cv2_rotate(self, im):
-        # Rotate a cv2 video manually
-        if self.orientation == 0:
+        # Rotate a cv2 video manually to maintain proper orientation
+        # Handle common rotation values from metadata
+        if self.orientation == 90:
             return cv2.rotate(im, cv2.ROTATE_90_CLOCKWISE)
         elif self.orientation == 180:
-            return cv2.rotate(im, cv2.ROTATE_90_COUNTERCLOCKWISE)
-        elif self.orientation == 90:
             return cv2.rotate(im, cv2.ROTATE_180)
+        elif self.orientation == 270:
+            return cv2.rotate(im, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        # For portrait videos that might be tagged as 0 but need rotation
+        # Check if height > width (portrait) and handle accordingly
+        h, w = im.shape[:2]
+        if h > w and self.orientation == 0:
+            # This might be a portrait video that doesn't need rotation
+            return im
         return im
 
     def __len__(self):
