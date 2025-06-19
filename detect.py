@@ -175,6 +175,7 @@ def run(
         vid_stride=1,  # video frame-rate stride
         save_stats=False,  # save detection statistics
         show_track_id=False,  # show track IDs on output video/images
+        save_frames=False,  # save full frame for each detected object
 ):
     source = str(source)
     save_img = not nosave and not source.endswith('.txt')  # save inference images
@@ -188,6 +189,8 @@ def run(
     # Directories
     save_dir = increment_path(Path(project) / name, exist_ok=exist_ok)  # increment run
     (save_dir / 'labels' if save_txt else save_dir).mkdir(parents=True, exist_ok=True)  # make dir
+    if save_frames:
+        (save_dir / 'frames').mkdir(parents=True, exist_ok=True)  # make frames dir
 
     # Initialize statistics tracking
     if save_stats or show_track_id:
@@ -343,6 +346,22 @@ def run(
                         annotator.box_label(xyxy, label, color=colors(c, True))
                     if save_crop:
                         save_one_box(xyxy, imc, file=save_dir / 'crops' / names[c] / f'{p.stem}.jpg', BGR=True)
+                    
+                    # Save full frame for each detected object
+                    if save_frames:
+                        # Create frame filename with detection info
+                        class_name = names[c]
+                        confidence = f"{conf:.2f}"
+                        
+                        # Include track ID if available
+                        if show_track_id and det_idx < len(track_ids):
+                            track_id = track_ids[det_idx]
+                            frame_filename = f"{p.stem}_frame{frame:06d}_{class_name}_conf{confidence}_id{track_id}.jpg"
+                        else:
+                            frame_filename = f"{p.stem}_frame{frame:06d}_{class_name}_conf{confidence}_det{det_idx:03d}.jpg"
+                        
+                        frame_save_path = save_dir / 'frames' / frame_filename
+                        cv2.imwrite(str(frame_save_path), im0)
 
             # Stream results
             im0 = annotator.result()
@@ -385,6 +404,9 @@ def run(
     if save_txt or save_img:
         s = f"\n{len(list(save_dir.glob('labels/*.txt')))} labels saved to {save_dir / 'labels'}" if save_txt else ''
         LOGGER.info(f"Results saved to {colorstr('bold', save_dir)}{s}")
+    if save_frames:
+        frame_count = len(list(save_dir.glob('frames/*.jpg')))
+        LOGGER.info(f"{frame_count} detection frames saved to {save_dir / 'frames'}")
     
     # Save statistics
     if save_stats:
@@ -440,6 +462,7 @@ def parse_opt():
     parser.add_argument('--save-crop', action='store_true', help='save cropped prediction boxes')
     parser.add_argument('--save-stats', action='store_true', help='save detection statistics using SORT tracking algorithm')
     parser.add_argument('--show-track-id', action='store_true', help='show track IDs on output video/images for debugging')
+    parser.add_argument('--save-frames', action='store_true', help='save full frame for each detected object')
     parser.add_argument('--nosave', action='store_true', help='do not save images/videos')
     parser.add_argument('--classes', nargs='+', type=int, help='filter by class: --classes 0, or --classes 0 2 3')
     parser.add_argument('--agnostic-nms', action='store_true', help='class-agnostic NMS')
