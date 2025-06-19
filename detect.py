@@ -176,6 +176,7 @@ def run(
         save_stats=False,  # save detection statistics
         show_track_id=False,  # show track IDs on output video/images
         save_frames=False,  # save full frame for each detected object
+        save_original_frames=False,  # save original frame (without annotations) for each detected object
 ):
     source = str(source)
     save_img = not nosave and not source.endswith('.txt')  # save inference images
@@ -191,6 +192,8 @@ def run(
     (save_dir / 'labels' if save_txt else save_dir).mkdir(parents=True, exist_ok=True)  # make dir
     if save_frames:
         (save_dir / 'frames').mkdir(parents=True, exist_ok=True)  # make frames dir
+    if save_original_frames:
+        (save_dir / 'original_frames').mkdir(parents=True, exist_ok=True)  # make original frames dir
 
     # Initialize statistics tracking
     if save_stats or show_track_id:
@@ -251,6 +254,9 @@ def run(
             p = Path(p)  # to Path
             save_path = str(save_dir / p.name)  # im.jpg
             txt_path = str(save_dir / 'labels' / p.stem) + ('' if dataset.mode == 'image' else f'_{frame}')  # im.txt
+            
+            # Save original frame (before annotations) for each detection if needed
+            original_frame = im0.copy() if (save_original_frames and len(det)) else None
             
             # Debug: Log frame dimensions for video processing
             if dataset.mode == 'video':
@@ -348,7 +354,7 @@ def run(
                         save_one_box(xyxy, imc, file=save_dir / 'crops' / names[c] / f'{p.stem}.jpg', BGR=True)
                     
                     # Save full frame for each detected object
-                    if save_frames:
+                    if save_frames or save_original_frames:
                         # Create frame filename with detection info
                         class_name = names[c]
                         confidence = f"{conf:.2f}"
@@ -360,8 +366,16 @@ def run(
                         else:
                             frame_filename = f"{p.stem}_frame{frame:06d}_{class_name}_conf{confidence}_det{det_idx:03d}.jpg"
                         
-                        frame_save_path = save_dir / 'frames' / frame_filename
-                        cv2.imwrite(str(frame_save_path), im0)
+                        # Save annotated frame
+                        if save_frames:
+                            frame_save_path = save_dir / 'frames' / frame_filename
+                            cv2.imwrite(str(frame_save_path), im0)
+                        
+                        # Save original frame (without annotations)
+                        if save_original_frames and original_frame is not None:
+                            original_filename = f"original_{frame_filename}"
+                            original_save_path = save_dir / 'original_frames' / original_filename
+                            cv2.imwrite(str(original_save_path), original_frame)
 
             # Stream results
             im0 = annotator.result()
@@ -407,6 +421,9 @@ def run(
     if save_frames:
         frame_count = len(list(save_dir.glob('frames/*.jpg')))
         LOGGER.info(f"{frame_count} detection frames saved to {save_dir / 'frames'}")
+    if save_original_frames:
+        original_frame_count = len(list(save_dir.glob('original_frames/*.jpg')))
+        LOGGER.info(f"{original_frame_count} original frames saved to {save_dir / 'original_frames'}")
     
     # Save statistics
     if save_stats:
@@ -463,6 +480,7 @@ def parse_opt():
     parser.add_argument('--save-stats', action='store_true', help='save detection statistics using SORT tracking algorithm')
     parser.add_argument('--show-track-id', action='store_true', help='show track IDs on output video/images for debugging')
     parser.add_argument('--save-frames', action='store_true', help='save full frame for each detected object')
+    parser.add_argument('--save-original-frames', action='store_true', help='save original frame (without annotations) for each detected object')
     parser.add_argument('--nosave', action='store_true', help='do not save images/videos')
     parser.add_argument('--classes', nargs='+', type=int, help='filter by class: --classes 0, or --classes 0 2 3')
     parser.add_argument('--agnostic-nms', action='store_true', help='class-agnostic NMS')
