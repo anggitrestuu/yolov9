@@ -130,7 +130,7 @@ def main():
     )
 
     # Model loading
-    weights_path = st.sidebar.text_input("Model Weights Path", "./weights/best.pt")
+    weights_path = st.sidebar.text_input("Model Weights Path", "./rdd2022/rdd-yolov9-c-converted.pt")
 
     # Load model
     @st.cache_resource
