@@ -1,13 +1,15 @@
 import torch
-from models.yolo import Model
+from models.yolo import Model, DetectionModel
 
 device = torch.device("cpu")
 cfg = "./models/detect/gelan-c.yaml"
-model = Model(cfg, ch=3, nc=5, anchors=3)
+model = Model(cfg, ch=3, nc=4, anchors=3)
 # model = model.half()
 model = model.to(device)
 _ = model.eval()
-ckpt = torch.load("./ship/novi.pt", map_location="cpu")
+
+# Load checkpoint with weights_only=False to allow custom classes
+ckpt = torch.load("./rdd2022/best.pt", map_location="cpu", weights_only=False)
 model.names = ckpt["model"].names
 model.nc = ckpt["model"].nc
 
@@ -76,7 +78,7 @@ m_ckpt = {
     "date": None,
     "epoch": -1,
 }
-torch.save(m_ckpt, "./ship/novi-converted.pt")
+torch.save(m_ckpt, "./rdd2022/rdd-yolov9-c-converted.pt")
 
 
 # python export.py --weights "./rdd/rdd-yolov9-c-converted.pt" --include onnx
